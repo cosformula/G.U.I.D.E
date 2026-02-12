@@ -86,6 +86,9 @@ func inject_input(event:InputEvent) -> void:
 ## config changes, you will need to call this method again.
 func set_remapping_config(config:GUIDERemappingConfig) -> void:
 	_active_remapping_config = config
+	# Remapping can change bound inputs while context mappings stay structurally
+	# identical. Force rebuilding active mappings to avoid reusing stale bindings.
+	_active_action_mappings.clear()
 	_update_caches()
 	
 	
