@@ -43,6 +43,8 @@ var _input_state:GUIDEInputState
 ## A lock, preventing a mapping context change while a mapping
 ## context change is currently in progress.
 var _locked:bool = false
+var _perf_process_total_usec: float = 0.0
+var _perf_process_frame_count: int = 0
 
 func _ready():
 	process_mode = Node.PROCESS_MODE_ALWAYS
@@ -53,11 +55,43 @@ func _ready():
 	# attach to the current viewport to get input events
 	GUIDEInputTracker._instrument.call_deferred(get_viewport())
 	
-	get_tree().node_added.connect(_on_node_added)
-	
+	var tree := get_tree()
+	if tree != null:
+		var node_added_callback := Callable(self, "_on_node_added")
+		if not tree.node_added.is_connected(node_added_callback):
+			tree.node_added.connect(node_added_callback)
+
 	# Emit a change of input mappings whenever a joystick was connected
 	# or disconnected.
-	Input.joy_connection_changed.connect(func(ig, ig2): input_mappings_changed.emit())
+	var joy_connection_callback := Callable(self, "_on_joy_connection_changed")
+	if not Input.joy_connection_changed.is_connected(joy_connection_callback):
+		Input.joy_connection_changed.connect(joy_connection_callback)
+
+
+func _exit_tree() -> void:
+	var tree := get_tree()
+	if tree != null:
+		var node_added_callback := Callable(self, "_on_node_added")
+		if tree.node_added.is_connected(node_added_callback):
+			tree.node_added.disconnect(node_added_callback)
+
+	var joy_connection_callback := Callable(self, "_on_joy_connection_changed")
+	if Input.joy_connection_changed.is_connected(joy_connection_callback):
+		Input.joy_connection_changed.disconnect(joy_connection_callback)
+
+	# Clear runtime references explicitly to reduce leaked references on shutdown.
+	_active_contexts.clear()
+	_active_action_mappings.clear()
+	_actions_sharing_input.clear()
+	_active_inputs.clear()
+	_active_modifiers.clear()
+	_active_remapping_config = null
+	_reset_node = null
+	_input_state = null
+
+
+func _on_joy_connection_changed(_device: int, _connected: bool) -> void:
+	input_mappings_changed.emit()
 
 
 ## Called when a node is added to the tree. If the node is a window
@@ -190,6 +224,7 @@ func _physics_process(delta: float) -> void:
 
 ## Processes all currently active actions
 func _process(delta:float) -> void:
+	var t0_usec := Time.get_ticks_usec()
 	var blocked_actions:GUIDESet = GUIDESet.new()
 	
 	for action_mapping:GUIDEActionMapping in _active_action_mappings:
@@ -220,27 +255,25 @@ func _process(delta:float) -> void:
 			
 		
 		# Now state change events.
-		match(action._last_state):
+		match action._last_state:
 			GUIDEAction.GUIDEActionState.TRIGGERED:
-				match(consolidated_trigger_state):
+				match consolidated_trigger_state:
 					GUIDETrigger.GUIDETriggerState.NONE:
 						action._completed(consolidated_value)
 					GUIDETrigger.GUIDETriggerState.ONGOING:
 						action._ongoing(consolidated_value, delta)
 					GUIDETrigger.GUIDETriggerState.TRIGGERED:
 						action._triggered(consolidated_value, delta)
-						
 			GUIDEAction.GUIDEActionState.ONGOING:
-				match(consolidated_trigger_state):
+				match consolidated_trigger_state:
 					GUIDETrigger.GUIDETriggerState.NONE:
 						action._cancelled(consolidated_value)
 					GUIDETrigger.GUIDETriggerState.ONGOING:
 						action._ongoing(consolidated_value, delta)
 					GUIDETrigger.GUIDETriggerState.TRIGGERED:
 						action._triggered(consolidated_value, delta)
-						
 			GUIDEAction.GUIDEActionState.COMPLETED:
-				match(consolidated_trigger_state):
+				match consolidated_trigger_state:
 					GUIDETrigger.GUIDETriggerState.NONE:
 						# make sure the value updated but don't emit any other events
 						action._update_value(consolidated_value)
@@ -248,6 +281,26 @@ func _process(delta:float) -> void:
 						action._started(consolidated_value)
 					GUIDETrigger.GUIDETriggerState.TRIGGERED:
 						action._triggered(consolidated_value, delta)
+	_perf_process_total_usec += float(Time.get_ticks_usec() - t0_usec)
+	_perf_process_frame_count += 1
+
+
+func consume_perf_counters() -> Dictionary:
+	var total_process_usec := _perf_process_total_usec
+	var total_process_frames := _perf_process_frame_count
+	if _reset_node != null:
+		var reset_counters_variant: Variant = _reset_node.call("consume_perf_counters")
+		if reset_counters_variant is Dictionary:
+			var reset_counters := reset_counters_variant as Dictionary
+			total_process_usec += float(reset_counters.get("process_usec", 0.0))
+			total_process_frames += int(reset_counters.get("process_frames", 0))
+	var counters := {
+		"process_usec": total_process_usec,
+		"process_frames": total_process_frames,
+	}
+	_perf_process_total_usec = 0.0
+	_perf_process_frame_count = 0
+	return counters
 
 
 ## Parses input mappings from a mapping context and adds them to an effective action mapping.
